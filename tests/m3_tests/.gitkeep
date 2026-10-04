@@ -1,6 +1,0 @@
-path,filename,extension,size_bytes,modified_time,permissions,is_hidden
-documents/report.pdf,report.pdf,.pdf,1000,2026-10-01T10:00:00,644,0
-images/photo.jpg,photo.jpg,.jpg,2000000,2026-10-01T10:00:00,644,0
-scripts/test.c,test.c,.c,4096,2026-10-01T10:00:00,664,0
-video/movie.mp4,movie.mp4,.mp4,150000000,2026-10-01T10:00:00,644,0
-archive/data.zip,data.zip,.zip,5000000,2026-10-01T10:00:00,644,1
