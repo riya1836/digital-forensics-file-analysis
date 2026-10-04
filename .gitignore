@@ -1,0 +1,16 @@
+# Compiled object files
+*.o
+
+# Compiled executables
+*.exe
+*.out
+
+# Build directory
+build/
+
+# VS Code local settings
+.vscode/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
