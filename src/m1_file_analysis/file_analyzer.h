@@ -1,34 +1,45 @@
 #ifndef FILE_ANALYZER_H
 #define FILE_ANALYZER_H
 
-#include <stdio.h>
+#include <stddef.h>
 
-#define PATH_BUFFER_SIZE 4096
-#define TIME_BUFFER_SIZE 64
-#define EXTENSION_BUFFER_SIZE 256
+#define MAX_PATH_LENGTH 4096
+#define MAX_TIME_LENGTH 32
+#define MAX_PERMISSION_LENGTH 16
 
 typedef struct {
-    char path[PATH_BUFFER_SIZE];
-    char filename[PATH_BUFFER_SIZE];
-    char extension[EXTENSION_BUFFER_SIZE];
+    char path[MAX_PATH_LENGTH];
+    char filename[MAX_PATH_LENGTH];
+    char extension[64];
     unsigned long long size_bytes;
-    char modified_time[TIME_BUFFER_SIZE];
-    unsigned int permissions;
+    char modified_time[MAX_TIME_LENGTH];
+    int permissions;
     int is_hidden;
 } FileMetadata;
 
-/* Scan input directory recursively and write metadata to CSV. */
-int analyze_directory(const char *input_directory, const char *output_file);
+/*
+ * Extract metadata from one regular file.
+ *
+ * Returns:
+ *   1 on success
+ *   0 on failure
+ */
+int extract_file_metadata(
+    const char *full_path,
+    const char *relative_path,
+    FileMetadata *metadata
+);
 
-/* Extract metadata for one file. */
-int extract_file_metadata(const char *full_path,
-                          const char *relative_path,
-                          FileMetadata *metadata);
-
-/* Write one metadata record to the CSV file. */
-void write_metadata_csv(FILE *output, const FileMetadata *metadata);
-
-/* Escape a value according to CSV rules. */
-void write_csv_field(FILE *output, const char *value);
+/*
+ * Scan an input directory recursively and create the metadata CSV.
+ *
+ * Returns:
+ *   number of files processed on success
+ *   -1 on directory/output error
+ */
+int analyze_directory(
+    const char *input_directory,
+    const char *metadata_output
+);
 
 #endif

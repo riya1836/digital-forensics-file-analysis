@@ -1,95 +1,91 @@
+#define _POSIX_C_SOURCE 200809L
 #include "file_analyzer.h"
 
-#include <windows.h>
-#include <io.h>
+#include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
-/*
- * Convert Windows FILETIME to a readable local timestamp.
- *
- * Output format:
- * YYYY-MM-DD HH:MM:SS
- */
-static void format_modified_time(FILETIME file_time,
-                                 char *buffer,
-                                 size_t buffer_size)
+/* ------------------------------------------------------------
+ * Helper: safely join two paths
+ * ------------------------------------------------------------ */
+static int build_path(
+    char *destination,
+    size_t destination_size,
+    const char *base,
+    const char *name
+)
 {
-    FILETIME local_file_time;
-    SYSTEMTIME system_time;
+    int written;
 
-    if (buffer == NULL || buffer_size == 0) {
-        return;
+    if (destination == NULL ||
+        base == NULL ||
+        name == NULL ||
+        destination_size == 0) {
+        return 0;
     }
 
-    if (!FileTimeToLocalFileTime(&file_time, &local_file_time)) {
-        snprintf(buffer, buffer_size, "N/A");
-        return;
+    if (base[0] == '\0') {
+        written = snprintf(
+            destination,
+            destination_size,
+            "%s",
+            name
+        );
+    } else {
+        written = snprintf(
+            destination,
+            destination_size,
+            "%s/%s",
+            base,
+            name
+        );
     }
 
-    if (!FileTimeToSystemTime(&local_file_time, &system_time)) {
-        snprintf(buffer, buffer_size, "N/A");
-        return;
+    if (written < 0 || (size_t)written >= destination_size) {
+        return 0;
     }
 
-    snprintf(buffer,
-             buffer_size,
-             "%04d-%02d-%02d %02d:%02d:%02d",
-             (int)system_time.wYear,
-             (int)system_time.wMonth,
-             (int)system_time.wDay,
-             (int)system_time.wHour,
-             (int)system_time.wMinute,
-             (int)system_time.wSecond);
+    return 1;
 }
 
-
-/*
- * Get the filename from a path.
- */
+/* ------------------------------------------------------------
+ * Helper: extract filename from a path
+ * ------------------------------------------------------------ */
 static const char *get_filename_from_path(const char *path)
 {
-    const char *last_backslash;
     const char *last_slash;
-    const char *filename;
 
-    last_backslash = strrchr(path, '\\');
+    if (path == NULL) {
+        return "";
+    }
+
     last_slash = strrchr(path, '/');
 
-    if (last_backslash != NULL && last_slash != NULL) {
-        filename = (last_backslash > last_slash)
-                     ? last_backslash + 1
-                     : last_slash + 1;
-    }
-    else if (last_backslash != NULL) {
-        filename = last_backslash + 1;
-    }
-    else if (last_slash != NULL) {
-        filename = last_slash + 1;
-    }
-    else {
-        filename = path;
+    if (last_slash == NULL) {
+        return path;
     }
 
-    return filename;
+    return last_slash + 1;
 }
 
-
-/*
- * Get file extension.
+/* ------------------------------------------------------------
+ * Helper: extract file extension
  *
- * Example:
- * document.pdf -> .pdf
- * photo.jpg    -> .jpg
- * README       -> empty string
- */
-static void get_extension(const char *filename,
-                          char *extension,
-                          size_t extension_size)
+ * Hidden files such as ".gitkeep" are treated as having
+ * no extension.
+ * ------------------------------------------------------------ */
+static void get_extension(
+    const char *filename,
+    char *extension,
+    size_t extension_size
+)
 {
-    const char *dot;
+    const char *last_dot;
     const char *last_slash;
 
     if (extension == NULL || extension_size == 0) {
@@ -102,239 +98,126 @@ static void get_extension(const char *filename,
         return;
     }
 
-    last_slash = strrchr(filename, '\\');
+    last_dot = strrchr(filename, '.');
+    last_slash = strrchr(filename, '/');
 
-    if (last_slash == NULL) {
-        last_slash = strrchr(filename, '/');
-    }
-
-    dot = strrchr(filename, '.');
-
-    if (dot == NULL) {
+    /*
+     * No dot.
+     */
+    if (last_dot == NULL) {
         return;
     }
 
     /*
-     * Ignore a dot that occurs before the filename itself.
+     * Dot belongs to a directory name.
      */
-    if (last_slash != NULL && dot < last_slash) {
+    if (last_slash != NULL && last_dot < last_slash) {
         return;
     }
 
     /*
-     * A filename such as ".gitignore" is treated as having
-     * no extension.
+     * ".gitkeep", ".bashrc", etc. are hidden files,
+     * not files with an extension.
      */
-    if (dot == filename) {
+    if (last_dot == filename) {
         return;
     }
 
-    strncpy(extension, dot, extension_size - 1);
-    extension[extension_size - 1] = '\0';
-}
-
-
-/*
- * Determine whether the file is hidden in Windows.
- */
-static int is_hidden_file(const char *full_path)
-{
-    DWORD attributes;
-
-    attributes = GetFileAttributesA(full_path);
-
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        return 0;
-    }
-
-    if ((attributes & FILE_ATTRIBUTE_HIDDEN) != 0) {
-        return 1;
-    }
-
-    return 0;
-}
-
-
-/*
- * Determine whether the current user has write access to the file.
- *
- * The README requires a permissions field and the later modules
- * interpret this as whether the file is writable.
- *
- * 1 = writable
- * 0 = not writable
- */
-static unsigned int get_permissions(const char *full_path)
-{
-    if (_access(full_path, 2) == 0) {
-        return 1;
-    }
-
-    return 0;
-}
-
-
-/*
- * Get the file size using Windows file information.
- */
-static unsigned long long get_file_size(
-    const WIN32_FILE_ATTRIBUTE_DATA *file_data)
-{
-    ULARGE_INTEGER file_size;
-
-    file_size.LowPart = file_data->nFileSizeLow;
-    file_size.HighPart = file_data->nFileSizeHigh;
-
-    return (unsigned long long)file_size.QuadPart;
-}
-
-
-/*
- * Extract metadata for a single file.
- */
-int extract_file_metadata(const char *full_path,
-                          const char *relative_path,
-                          FileMetadata *metadata)
-{
-    WIN32_FILE_ATTRIBUTE_DATA file_data;
-    const char *filename;
-
-    if (full_path == NULL ||
-        relative_path == NULL ||
-        metadata == NULL) {
-        return 0;
-    }
-
-    if (!GetFileAttributesExA(full_path,
-                              GetFileExInfoStandard,
-                              &file_data)) {
-        return 0;
-    }
-
     /*
-     * Make sure the path refers to a file and not a directory.
+     * Filename ending in "." has no useful extension.
      */
-    if ((file_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-        return 0;
-    }
-
-    memset(metadata, 0, sizeof(FileMetadata));
-
-    /*
-     * Path
-     */
-    strncpy(metadata->path,
-            relative_path,
-            PATH_BUFFER_SIZE - 1);
-
-    metadata->path[PATH_BUFFER_SIZE - 1] = '\0';
-
-    /*
-     * Filename
-     */
-    filename = get_filename_from_path(relative_path);
-
-    strncpy(metadata->filename,
-            filename,
-            PATH_BUFFER_SIZE - 1);
-
-    metadata->filename[PATH_BUFFER_SIZE - 1] = '\0';
-
-    /*
-     * Extension
-     */
-    get_extension(metadata->filename,
-                  metadata->extension,
-                  EXTENSION_BUFFER_SIZE);
-
-    /*
-     * File size
-     */
-    metadata->size_bytes = get_file_size(&file_data);
-
-    /*
-     * Modified time
-     */
-    format_modified_time(file_data.ftLastWriteTime,
-                          metadata->modified_time,
-                          TIME_BUFFER_SIZE);
-
-    /*
-     * Permissions
-     */
-    metadata->permissions = get_permissions(full_path);
-
-    /*
-     * Hidden flag
-     */
-    metadata->is_hidden = is_hidden_file(full_path);
-
-    return 1;
-}
-
-
-/*
- * Write one CSV field.
- *
- * If a field contains a comma, quote, or newline,
- * it is enclosed in double quotes.
- *
- * A double quote inside the field is represented by
- * two double quotes.
- */
-void write_csv_field(FILE *output, const char *value)
-{
-    const char *current;
-    int needs_quotes;
-
-    if (output == NULL || value == NULL) {
+    if (*(last_dot + 1) == '\0') {
         return;
     }
 
-    needs_quotes = 0;
-    current = value;
+    snprintf(
+        extension,
+        extension_size,
+        "%s",
+        last_dot
+    );
+}
 
-    while (*current != '\0') {
-        if (*current == ',' ||
-            *current == '"' ||
-            *current == '\n' ||
-            *current == '\r') {
+/* ------------------------------------------------------------
+ * Helper: determine whether a filename is hidden
+ * ------------------------------------------------------------ */
+static int is_hidden_filename(const char *filename)
+{
+    if (filename == NULL || filename[0] == '\0') {
+        return 0;
+    }
+
+    return filename[0] == '.' ? 1 : 0;
+}
+
+/* ------------------------------------------------------------
+ * Helper: escape a CSV field
+ *
+ * A field is quoted if it contains:
+ *   comma
+ *   quote
+ *   newline
+ * ------------------------------------------------------------ */
+static void write_csv_field(
+    FILE *output,
+    const char *field
+)
+{
+    const char *ptr;
+    int needs_quotes = 0;
+
+    if (output == NULL) {
+        return;
+    }
+
+    if (field == NULL) {
+        field = "";
+    }
+
+    ptr = field;
+
+    while (*ptr != '\0') {
+        if (*ptr == ',' ||
+            *ptr == '"' ||
+            *ptr == '\n' ||
+            *ptr == '\r') {
             needs_quotes = 1;
             break;
         }
 
-        current++;
+        ptr++;
     }
 
     if (!needs_quotes) {
-        fputs(value, output);
+        fputs(field, output);
         return;
     }
 
     fputc('"', output);
 
-    current = value;
+    ptr = field;
 
-    while (*current != '\0') {
-        if (*current == '"') {
+    while (*ptr != '\0') {
+        if (*ptr == '"') {
             fputc('"', output);
             fputc('"', output);
-        }
-        else {
-            fputc(*current, output);
+        } else {
+            fputc(*ptr, output);
         }
 
-        current++;
+        ptr++;
     }
 
     fputc('"', output);
 }
 
-
-/*
- * Write one metadata record to the CSV file.
- */
-void write_metadata_csv(FILE *output, const FileMetadata *metadata)
+/* ------------------------------------------------------------
+ * Helper: write one metadata record to CSV
+ * ------------------------------------------------------------ */
+static void write_metadata_csv(
+    FILE *output,
+    const FileMetadata *metadata
+)
 {
     if (output == NULL || metadata == NULL) {
         return;
@@ -349,218 +232,454 @@ void write_metadata_csv(FILE *output, const FileMetadata *metadata)
     write_csv_field(output, metadata->extension);
     fputc(',', output);
 
-    fprintf(output,
-            "%llu,",
-            metadata->size_bytes);
+    fprintf(
+        output,
+        "%llu,",
+        metadata->size_bytes
+    );
 
     write_csv_field(output, metadata->modified_time);
     fputc(',', output);
 
-    fprintf(output,
-            "%u,",
-            metadata->permissions);
+    fprintf(
+        output,
+        "%d,",
+        metadata->permissions
+    );
 
-    fprintf(output,
-            "%d\n",
-            metadata->is_hidden);
+    fprintf(
+        output,
+        "%d\n",
+        metadata->is_hidden
+    );
 }
 
-
-/*
- * Recursively scan a directory.
- */
-static int scan_directory(const char *directory,
-                          const char *relative_directory,
-                          FILE *output)
+/* ------------------------------------------------------------
+ * Extract metadata from one regular file
+ * ------------------------------------------------------------ */
+int extract_file_metadata(
+    const char *full_path,
+    const char *relative_path,
+    FileMetadata *metadata
+)
 {
-    char search_pattern[PATH_BUFFER_SIZE];
-    WIN32_FIND_DATAA find_data;
-    HANDLE find_handle;
-    int files_processed;
+    struct stat file_info;
+    struct tm time_info;
+    const char *filename;
+    int owner_write_permission;
 
-    files_processed = 0;
-
-    /*
-     * Build:
-     * directory\*
-     */
-    snprintf(search_pattern,
-             sizeof(search_pattern),
-             "%s\\*",
-             directory);
-
-    find_handle = FindFirstFileA(search_pattern, &find_data);
-
-    if (find_handle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr,
-                "Warning: unable to access directory: %s\n",
-                directory);
+    if (full_path == NULL ||
+        relative_path == NULL ||
+        metadata == NULL) {
         return 0;
     }
 
-    do {
-        char full_path[PATH_BUFFER_SIZE];
-        char relative_path[PATH_BUFFER_SIZE];
+    /*
+     * Read filesystem metadata.
+     */
+    if (stat(full_path, &file_info) != 0) {
+        fprintf(
+            stderr,
+            "Error: Cannot access file '%s': %s\n",
+            full_path,
+            strerror(errno)
+        );
+
+        return 0;
+    }
+
+    /*
+     * M1 processes regular files.
+     */
+    if (!S_ISREG(file_info.st_mode)) {
+        return 0;
+    }
+
+    memset(metadata, 0, sizeof(FileMetadata));
+
+    /*
+     * Relative path.
+     */
+    snprintf(
+        metadata->path,
+        sizeof(metadata->path),
+        "%s",
+        relative_path
+    );
+
+    /*
+     * Filename.
+     */
+    filename = get_filename_from_path(relative_path);
+
+    snprintf(
+        metadata->filename,
+        sizeof(metadata->filename),
+        "%s",
+        filename
+    );
+
+    /*
+     * Extension.
+     */
+    get_extension(
+        filename,
+        metadata->extension,
+        sizeof(metadata->extension)
+    );
+
+    /*
+     * File size.
+     */
+    metadata->size_bytes =
+        (unsigned long long)file_info.st_size;
+
+    /*
+     * Modified time.
+     *
+     * Format:
+     * YYYY-MM-DD HH:MM:SS
+     */
+    if (localtime_r(
+            &file_info.st_mtime,
+            &time_info
+        ) == NULL) {
+
+        fprintf(
+            stderr,
+            "Error: Cannot convert modification time for '%s'\n",
+            full_path
+        );
+
+        return 0;
+    }
+
+    if (strftime(
+            metadata->modified_time,
+            sizeof(metadata->modified_time),
+            "%Y-%m-%d %H:%M:%S",
+            &time_info
+        ) == 0) {
+
+        fprintf(
+            stderr,
+            "Error: Cannot format modification time for '%s'\n",
+            full_path
+        );
+
+        return 0;
+    }
+
+    /*
+     * Permissions.
+     *
+     * Project representation:
+     *   1 = owner has write permission
+     *   0 = otherwise
+     */
+    owner_write_permission =
+        (file_info.st_mode & S_IWUSR) ? 1 : 0;
+
+    metadata->permissions =
+        owner_write_permission;
+
+    /*
+     * Hidden file.
+     *
+     * Linux convention:
+     * filename beginning with '.' is hidden.
+     */
+    metadata->is_hidden =
+        is_hidden_filename(filename);
+
+    return 1;
+}
+
+/* ------------------------------------------------------------
+ * Recursive directory scanning
+ * ------------------------------------------------------------ */
+static int scan_directory(
+    const char *directory_path,
+    const char *relative_directory,
+    FILE *output
+)
+{
+    DIR *directory;
+    struct dirent *entry;
+    int files_processed = 0;
+
+    if (directory_path == NULL ||
+        relative_directory == NULL ||
+        output == NULL) {
+        return -1;
+    }
+
+    directory = opendir(directory_path);
+
+    if (directory == NULL) {
+        fprintf(
+            stderr,
+            "Error: Cannot open directory '%s': %s\n",
+            directory_path,
+            strerror(errno)
+        );
+
+        return -1;
+    }
+
+    while ((entry = readdir(directory)) != NULL) {
+
+        char full_path[MAX_PATH_LENGTH];
+        char relative_path[MAX_PATH_LENGTH];
+        struct stat entry_info;
+        FileMetadata metadata;
 
         /*
-         * Ignore "." and "..".
+         * Never recursively process "." or "..".
          */
-        if (strcmp(find_data.cFileName, ".") == 0 ||
-            strcmp(find_data.cFileName, "..") == 0) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
             continue;
         }
 
         /*
-         * Build full path.
+         * Build complete filesystem path.
          */
-        snprintf(full_path,
-                 sizeof(full_path),
-                 "%s\\%s",
-                 directory,
-                 find_data.cFileName);
+        if (!build_path(
+                full_path,
+                sizeof(full_path),
+                directory_path,
+                entry->d_name
+            )) {
+
+            fprintf(
+                stderr,
+                "Warning: Path too long, skipping '%s'\n",
+                entry->d_name
+            );
+
+            continue;
+        }
 
         /*
          * Build path relative to the input directory.
          */
-        if (relative_directory == NULL ||
-            relative_directory[0] == '\0') {
+        if (relative_directory[0] == '\0') {
 
-            snprintf(relative_path,
-                     sizeof(relative_path),
-                     "%s",
-                     find_data.cFileName);
-        }
-        else {
-            snprintf(relative_path,
-                     sizeof(relative_path),
-                     "%s\\%s",
-                     relative_directory,
-                     find_data.cFileName);
-        }
+            if (!build_path(
+                    relative_path,
+                    sizeof(relative_path),
+                    "",
+                    entry->d_name
+                )) {
 
-        /*
-         * If this is a directory, recursively scan it.
-         */
-        if ((find_data.dwFileAttributes &
-             FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                fprintf(
+                    stderr,
+                    "Warning: Relative path too long, skipping '%s'\n",
+                    entry->d_name
+                );
 
-            /*
-             * Skip reparse points such as symbolic links/junctions.
-             * This prevents accidental recursive loops.
-             */
-            if ((find_data.dwFileAttributes &
-                 FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
                 continue;
             }
 
-            files_processed += scan_directory(full_path,
-                                               relative_path,
-                                               output);
+        } else {
+
+            if (!build_path(
+                    relative_path,
+                    sizeof(relative_path),
+                    relative_directory,
+                    entry->d_name
+                )) {
+
+                fprintf(
+                    stderr,
+                    "Warning: Relative path too long, skipping '%s'\n",
+                    entry->d_name
+                );
+
+                continue;
+            }
         }
-        else {
-            FileMetadata metadata;
 
-            if (extract_file_metadata(full_path,
-                                      relative_path,
-                                      &metadata)) {
+        /*
+         * Obtain information about this filesystem entry.
+         */
+        if (stat(full_path, &entry_info) != 0) {
 
-                write_metadata_csv(output, &metadata);
+            fprintf(
+                stderr,
+                "Warning: Cannot access '%s': %s\n",
+                full_path,
+                strerror(errno)
+            );
+
+            continue;
+        }
+
+        /*
+         * Recursively process directories.
+         */
+        if (S_ISDIR(entry_info.st_mode)) {
+
+            int result;
+
+            result = scan_directory(
+                full_path,
+                relative_path,
+                output
+            );
+
+            if (result < 0) {
+                closedir(directory);
+                return -1;
+            }
+
+            files_processed += result;
+        }
+
+        /*
+         * Process regular files.
+         */
+        else if (S_ISREG(entry_info.st_mode)) {
+
+            if (extract_file_metadata(
+                    full_path,
+                    relative_path,
+                    &metadata
+                )) {
+
+                write_metadata_csv(
+                    output,
+                    &metadata
+                );
+
                 files_processed++;
             }
-            else {
-                fprintf(stderr,
-                        "Warning: unable to analyze file: %s\n",
-                        full_path);
-            }
         }
 
-    } while (FindNextFileA(find_handle, &find_data));
+        /*
+         * Other filesystem objects such as symbolic links,
+         * devices, sockets, etc. are ignored.
+         */
+    }
 
-    FindClose(find_handle);
+    closedir(directory);
 
     return files_processed;
 }
 
-
-/*
- * Main M1 analysis function.
- */
-int analyze_directory(const char *input_directory,
-                      const char *output_file)
+/* ------------------------------------------------------------
+ * Public directory-analysis function
+ * ------------------------------------------------------------ */
+int analyze_directory(
+    const char *input_directory,
+    const char *metadata_output
+)
 {
     FILE *output;
-    DWORD attributes;
+    struct stat input_info;
     int files_processed;
 
     if (input_directory == NULL ||
-        output_file == NULL) {
-        fprintf(stderr,
-                "Error: invalid input or output path.\n");
-        return 0;
+        metadata_output == NULL) {
+
+        fprintf(
+            stderr,
+            "Error: Invalid input arguments.\n"
+        );
+
+        return -1;
     }
 
     /*
-     * Verify that the input path exists.
+     * Verify input directory exists.
      */
-    attributes = GetFileAttributesA(input_directory);
+    if (stat(input_directory, &input_info) != 0) {
 
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        fprintf(stderr,
-                "Error: input directory does not exist: %s\n",
-                input_directory);
-        return 0;
+        fprintf(
+            stderr,
+            "Error: Cannot access input directory '%s': %s\n",
+            input_directory,
+            strerror(errno)
+        );
+
+        return -1;
+    }
+
+    if (!S_ISDIR(input_info.st_mode)) {
+
+        fprintf(
+            stderr,
+            "Error: '%s' is not a directory.\n",
+            input_directory
+        );
+
+        return -1;
     }
 
     /*
-     * Verify that the input path is actually a directory.
+     * Create output CSV.
      */
-    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-        fprintf(stderr,
-                "Error: input path is not a directory: %s\n",
-                input_directory);
-        return 0;
-    }
-
-    /*
-     * Open output CSV.
-     */
-    output = fopen(output_file, "w");
+    output = fopen(metadata_output, "w");
 
     if (output == NULL) {
-        fprintf(stderr,
-                "Error: unable to create output file: %s\n",
-                output_file);
-        return 0;
+
+        fprintf(
+            stderr,
+            "Error: Cannot create output file '%s': %s\n",
+            metadata_output,
+            strerror(errno)
+        );
+
+        return -1;
     }
 
     /*
-     * Required CSV header from the README.
+     * Required CSV header.
      */
-    fprintf(output,
-            "path,filename,extension,size_bytes,modified_time,permissions,is_hidden\n");
+    fprintf(
+        output,
+        "path,filename,extension,size_bytes,modified_time,permissions,is_hidden\n"
+    );
 
     /*
-     * Recursively scan all files.
+     * Recursively scan input directory.
      */
-    files_processed = scan_directory(input_directory,
-                                      "",
-                                      output);
+    files_processed = scan_directory(
+        input_directory,
+        "",
+        output
+    );
 
-    fclose(output);
+    if (files_processed < 0) {
+        fclose(output);
+        return -1;
+    }
+
+    /*
+     * Make sure all output data is written.
+     */
+    if (fclose(output) != 0) {
+
+        fprintf(
+            stderr,
+            "Error: Failed to close output file '%s'.\n",
+            metadata_output
+        );
+
+        return -1;
+    }
 
     return files_processed;
 }
 
-
-/*
- * Program entry point.
+/* ------------------------------------------------------------
+ * Command-line program
  *
- * Usage:
- *     file_analyzer <input_directory> <metadata_output>
+ * This main function is excluded when compiling M1 tests:
  *
- * Example:
- *     file_analyzer data/small intermediate/metadata.csv
- */
+ * gcc -DM1_TEST ...
+ * ------------------------------------------------------------ */
 #ifndef M1_TEST
 
 int main(int argc, char *argv[])
@@ -568,18 +687,26 @@ int main(int argc, char *argv[])
     int files_processed;
 
     if (argc != 3) {
-        fprintf(stderr,
-                "Usage: %s <input_directory> <metadata_output>\n",
-                argv[0]);
 
-        fprintf(stderr,
-                "Example: %s data\\small intermediate\\metadata.csv\n",
-                argv[0]);
+        fprintf(
+            stderr,
+            "Usage: %s <input_directory> <metadata_output>\n",
+            argv[0]
+        );
+
+        fprintf(
+            stderr,
+            "Example: %s data/small intermediate/metadata.csv\n",
+            argv[0]
+        );
 
         return 1;
     }
 
-    files_processed = analyze_directory(argv[1], argv[2]);
+    files_processed = analyze_directory(
+        argv[1],
+        argv[2]
+    );
 
     if (files_processed < 0) {
         return 1;

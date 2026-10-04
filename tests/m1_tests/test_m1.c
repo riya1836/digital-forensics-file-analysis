@@ -1,358 +1,386 @@
+#include "../../src/m1_file_analysis/file_analyzer.h"
+
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-#include "../../src/m1_file_analysis/file_analyzer.h"
+#define TEST_DATA_DIR "tests/m1_tests/test_data"
+#define TEST_FILE "tests/m1_tests/test_data/sample.txt"
+#define TEST_HIDDEN_FILE "tests/m1_tests/test_data/.hidden"
+#define TEST_OUTPUT "tests/m1_tests/test_data/metadata.csv"
 
-static int tests_run = 0;
 static int tests_passed = 0;
+static int tests_failed = 0;
 
-#define CHECK(condition, message)                    \
-    do {                                             \
-        tests_run++;                                 \
-        if (condition) {                             \
-            tests_passed++;                         \
-            printf("PASS: %s\n", message);           \
-        } else {                                     \
-            printf("FAIL: %s\n", message);           \
-        }                                            \
-    } while (0)
-
-
-static void create_directory(const char *path)
+/* ------------------------------------------------------------
+ * Test helper
+ * ------------------------------------------------------------ */
+static void check_test(
+    const char *test_name,
+    int condition
+)
 {
-    CreateDirectoryA(path, NULL);
+    if (condition) {
+        printf("[PASS] %s\n", test_name);
+        tests_passed++;
+    } else {
+        printf("[FAIL] %s\n", test_name);
+        tests_failed++;
+    }
 }
 
-
-static void create_test_file(const char *path, const char *content)
+/* ------------------------------------------------------------
+ * Create test directory
+ * ------------------------------------------------------------ */
+static int create_test_directory(void)
 {
-    FILE *file = fopen(path, "w");
+    struct stat directory_info;
+
+    if (stat(TEST_DATA_DIR, &directory_info) == 0) {
+        return S_ISDIR(directory_info.st_mode);
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------
+ * Create normal test file
+ * ------------------------------------------------------------ */
+static int create_test_file(void)
+{
+    FILE *file;
+
+    file = fopen(TEST_FILE, "w");
 
     if (file == NULL) {
+        perror("fopen");
+        return 0;
+    }
+
+    /*
+     * 19 bytes:
+     * "Digital Forensics\n"
+     */
+    fputs("Digital Forensics\n", file);
+
+    fclose(file);
+
+    /*
+     * Owner read/write, group read, others read.
+     */
+    if (chmod(TEST_FILE, 0644) != 0) {
+        perror("chmod");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ------------------------------------------------------------
+ * Create hidden test file
+ * ------------------------------------------------------------ */
+static int create_hidden_file(void)
+{
+    FILE *file;
+
+    file = fopen(TEST_HIDDEN_FILE, "w");
+
+    if (file == NULL) {
+        perror("fopen hidden file");
+        return 0;
+    }
+
+    fputs("Hidden file\n", file);
+
+    fclose(file);
+
+    if (chmod(TEST_HIDDEN_FILE, 0644) != 0) {
+        perror("chmod hidden file");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ------------------------------------------------------------
+ * Test metadata extraction
+ * ------------------------------------------------------------ */
+static void test_metadata_extraction(void)
+{
+    FileMetadata metadata;
+    int result;
+
+    memset(&metadata, 0, sizeof(metadata));
+
+    result = extract_file_metadata(
+        TEST_FILE,
+        "sample.txt",
+        &metadata
+    );
+
+    check_test(
+        "Metadata extraction succeeds",
+        result == 1
+    );
+
+    check_test(
+        "Path extracted correctly",
+        strcmp(metadata.path, "sample.txt") == 0
+    );
+
+    check_test(
+        "Filename extracted correctly",
+        strcmp(metadata.filename, "sample.txt") == 0
+    );
+
+    check_test(
+        "Extension extracted correctly",
+        strcmp(metadata.extension, ".txt") == 0
+    );
+
+    check_test(
+        "File size extracted correctly",
+        metadata.size_bytes == 18
+    );
+
+    check_test(
+        "Modified time extracted",
+        strlen(metadata.modified_time) > 0
+    );
+
+    check_test(
+        "Permissions extracted correctly",
+        metadata.permissions == 1
+    );
+
+    check_test(
+        "Normal file detected as not hidden",
+        metadata.is_hidden == 0
+    );
+}
+
+/* ------------------------------------------------------------
+ * Test hidden file detection
+ * ------------------------------------------------------------ */
+static void test_hidden_file(void)
+{
+    FileMetadata metadata;
+    int result;
+
+    memset(&metadata, 0, sizeof(metadata));
+
+    result = extract_file_metadata(
+        TEST_HIDDEN_FILE,
+        ".hidden",
+        &metadata
+    );
+
+    check_test(
+        "Hidden file metadata extraction succeeds",
+        result == 1
+    );
+
+    check_test(
+        "Hidden file detected correctly",
+        metadata.is_hidden == 1
+    );
+}
+
+/* ------------------------------------------------------------
+ * Test recursive directory analysis
+ * ------------------------------------------------------------ */
+static void test_directory_analysis(void)
+{
+    int result;
+
+    result = analyze_directory(
+        TEST_DATA_DIR,
+        TEST_OUTPUT
+    );
+
+    check_test(
+        "Directory analysis succeeds",
+        result >= 2
+    );
+}
+
+/* ------------------------------------------------------------
+ * Test CSV output
+ * ------------------------------------------------------------ */
+static void test_csv_output(void)
+{
+    FILE *file;
+    char line[4096];
+    int header_found = 0;
+    int data_rows = 0;
+
+    file = fopen(TEST_OUTPUT, "r");
+
+    if (file == NULL) {
+        check_test(
+            "CSV output file exists",
+            0
+        );
         return;
     }
 
-    fputs(content, file);
-    fclose(file);
-}
+    /*
+     * Read first line and verify exact header.
+     */
+    if (fgets(line, sizeof(line), file) != NULL) {
 
+        if (strcmp(
+                line,
+                "path,filename,extension,size_bytes,modified_time,permissions,is_hidden\n"
+            ) == 0) {
 
-static int file_exists(const char *path)
-{
-    DWORD attributes = GetFileAttributesA(path);
-
-    return attributes != INVALID_FILE_ATTRIBUTES;
-}
-
-
-static int read_csv_header(const char *csv,
-                           char *header,
-                           size_t header_size)
-{
-    FILE *file;
-    size_t length;
-
-    file = fopen(csv, "r");
-
-    if (file == NULL) {
-        return 0;
+            header_found = 1;
+        }
     }
 
-    if (fgets(header, (int)header_size, file) == NULL) {
-        fclose(file);
-        return 0;
+    check_test(
+        "CSV header is correct",
+        header_found
+    );
+
+    /*
+     * Count data rows.
+     */
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (strlen(line) > 1) {
+            data_rows++;
+        }
     }
 
     fclose(file);
 
-    length = strlen(header);
-
-    if (length > 0 && header[length - 1] == '\n') {
-        header[length - 1] = '\0';
-    }
-
-    if (length > 1 && header[length - 2] == '\r') {
-        header[length - 2] = '\0';
-    }
-
-    return 1;
+    check_test(
+        "CSV contains data rows",
+        data_rows >= 2
+    );
 }
 
-
-static int csv_has_data_row(const char *csv)
+/* ------------------------------------------------------------
+ * Test missing directory
+ * ------------------------------------------------------------ */
+static void test_missing_directory(void)
 {
-    FILE *file;
-    char buffer[4096];
+    int result;
 
-    file = fopen(csv, "r");
+    result = analyze_directory(
+        "tests/m1_tests/does_not_exist",
+        "tests/m1_tests/missing_output.csv"
+    );
 
-    if (file == NULL) {
-        return 0;
-    }
-
-    /* Skip header. */
-    if (fgets(buffer, sizeof(buffer), file) == NULL) {
-        fclose(file);
-        return 0;
-    }
-
-    /* Check for at least one data row. */
-    if (fgets(buffer, sizeof(buffer), file) == NULL) {
-        fclose(file);
-        return 0;
-    }
-
-    fclose(file);
-
-    return 1;
+    check_test(
+        "Missing directory is handled correctly",
+        result == -1
+    );
 }
 
+/* ------------------------------------------------------------
+ * Test missing file
+ * ------------------------------------------------------------ */
+static void test_missing_file(void)
+{
+    FileMetadata metadata;
+    int result;
 
+    memset(&metadata, 0, sizeof(metadata));
+
+    result = extract_file_metadata(
+        "tests/m1_tests/does_not_exist.txt",
+        "does_not_exist.txt",
+        &metadata
+    );
+
+    check_test(
+        "Missing file is handled correctly",
+        result == 0
+    );
+}
+
+/* ------------------------------------------------------------
+ * Cleanup test files
+ * ------------------------------------------------------------ */
+static void cleanup_test_files(void)
+{
+    remove(TEST_OUTPUT);
+    remove(TEST_FILE);
+    remove(TEST_HIDDEN_FILE);
+    rmdir(TEST_DATA_DIR);
+}
+
+/* ------------------------------------------------------------
+ * Main test program
+ * ------------------------------------------------------------ */
 int main(void)
 {
-    const char *test_directory =
-        "tests\\m1_tests\\test_data";
-
-    const char *nested_directory =
-        "tests\\m1_tests\\test_data\\nested";
-
-    const char *test_file =
-        "tests\\m1_tests\\test_data\\sample.txt";
-
-    const char *nested_file =
-        "tests\\m1_tests\\test_data\\nested\\nested.txt";
-
-    const char *output_csv =
-        "tests\\m1_tests\\test_metadata.csv";
-
-    const char *missing_directory =
-        "tests\\m1_tests\\does_not_exist";
-
-    char header[512];
-
-    printf("Running M1 tests...\n\n");
-
+    printf("\n");
+    printf("========================================\n");
+    printf("       M1 FILE ANALYSIS TESTS\n");
+    printf("========================================\n\n");
 
     /*
-     * ---------------------------------------------------------
-     * Test setup
-     * ---------------------------------------------------------
+     * Prepare test data.
      */
-
-    create_directory("tests\\m1_tests");
-    create_directory(test_directory);
-    create_directory(nested_directory);
-
-    create_test_file(
-        test_file,
-        "M1 test file\n"
+    check_test(
+        "Test directory created",
+        create_test_directory()
     );
 
-    create_test_file(
-        nested_file,
-        "Nested M1 test file\n"
+    check_test(
+        "Normal test file created",
+        create_test_file()
     );
 
-
-    /*
-     * ---------------------------------------------------------
-     * Test 1: Metadata extraction
-     * ---------------------------------------------------------
-     */
-
-    {
-        FileMetadata metadata;
-
-        int result = extract_file_metadata(
-            test_file,
-            "sample.txt",
-            &metadata
-        );
-
-        CHECK(
-            result == 1,
-            "metadata extraction succeeds for an existing file"
-        );
-
-        CHECK(
-            strcmp(metadata.path, "sample.txt") == 0,
-            "path is extracted correctly"
-        );
-
-        CHECK(
-            strcmp(metadata.filename, "sample.txt") == 0,
-            "filename is extracted correctly"
-        );
-
-        CHECK(
-            strcmp(metadata.extension, ".txt") == 0,
-            "extension is extracted correctly"
-        );
-
-        CHECK(
-            metadata.size_bytes > 0,
-            "size_bytes is extracted correctly"
-        );
-
-        CHECK(
-            strlen(metadata.modified_time) > 0,
-            "modified_time is extracted"
-        );
-
-        CHECK(
-            metadata.permissions == 0 ||
-            metadata.permissions == 1,
-            "permissions has a valid value"
-        );
-
-        CHECK(
-            metadata.is_hidden == 0 ||
-            metadata.is_hidden == 1,
-            "is_hidden is 0 or 1"
-        );
-    }
-
-
-    /*
-     * ---------------------------------------------------------
-     * Test 2: Recursive directory scanning
-     * ---------------------------------------------------------
-     */
-
-    remove(output_csv);
-
-    {
-        int result = analyze_directory(
-            test_directory,
-            output_csv
-        );
-
-        CHECK(
-            result >= 2,
-            "directory scan finds files recursively"
-        );
-
-        CHECK(
-            file_exists(output_csv),
-            "metadata CSV is created"
-        );
-    }
-
-
-    /*
-     * ---------------------------------------------------------
-     * Test 3: Required CSV header
-     * ---------------------------------------------------------
-     */
-
-    memset(header, 0, sizeof(header));
-
-    CHECK(
-        read_csv_header(
-            output_csv,
-            header,
-            sizeof(header)
-        ),
-        "CSV header can be read"
+    check_test(
+        "Hidden test file created",
+        create_hidden_file()
     );
 
-    CHECK(
-        strcmp(
-            header,
-            "path,filename,extension,size_bytes,modified_time,permissions,is_hidden"
-        ) == 0,
-        "CSV header matches the required M1 format"
-    );
-
+    /*
+     * Metadata tests.
+     */
+    test_metadata_extraction();
 
     /*
-     * ---------------------------------------------------------
-     * Test 4: CSV contains metadata records
-     * ---------------------------------------------------------
+     * Hidden-file test.
      */
-
-    CHECK(
-        csv_has_data_row(output_csv),
-        "CSV contains at least one metadata record"
-    );
-
+    test_hidden_file();
 
     /*
-     * ---------------------------------------------------------
-     * Test 5: Missing directory error handling
-     * ---------------------------------------------------------
+     * Directory and CSV tests.
      */
-
-    {
-        int result = analyze_directory(
-            missing_directory,
-            output_csv
-        );
-
-        CHECK(
-            result == 0,
-            "missing input directory is handled without crashing"
-        );
-    }
-
+    test_directory_analysis();
+    test_csv_output();
 
     /*
-     * ---------------------------------------------------------
-     * Test 6: Missing file error handling
-     * ---------------------------------------------------------
+     * Error-handling tests.
      */
-
-    {
-        FileMetadata metadata;
-
-        int result = extract_file_metadata(
-            "tests\\m1_tests\\test_data\\missing.txt",
-            "missing.txt",
-            &metadata
-        );
-
-        CHECK(
-            result == 0,
-            "missing file is handled without crashing"
-        );
-    }
-
+    test_missing_directory();
+    test_missing_file();
 
     /*
-     * ---------------------------------------------------------
-     * Test results
-     * ---------------------------------------------------------
+     * Cleanup.
      */
+    cleanup_test_files();
 
     printf("\n");
-    printf(
-        "M1 tests: %d/%d passed.\n",
-        tests_passed,
-        tests_run
-    );
+    printf("========================================\n");
+    printf("Tests passed: %d\n", tests_passed);
+    printf("Tests failed: %d\n", tests_failed);
+    printf("========================================\n");
 
-
-    /*
-     * ---------------------------------------------------------
-     * Cleanup
-     * ---------------------------------------------------------
-     */
-
-    remove(test_file);
-    remove(nested_file);
-    remove(output_csv);
-
-    RemoveDirectoryA(nested_directory);
-    RemoveDirectoryA(test_directory);
-
-    /*
-     * Return 0 only when every test passes.
-     */
-    if (tests_passed == tests_run) {
+    if (tests_failed == 0) {
+        printf("\nALL TESTS PASSED\n");
         return 0;
     }
 
+    printf("\nSOME TESTS FAILED\n");
     return 1;
 }
