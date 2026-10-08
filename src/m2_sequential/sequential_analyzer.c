@@ -494,42 +494,61 @@ int process_metadata(
             capacity = new_capacity;
         }
 
-        snprintf(
+        /*
+         * Validate field lengths before copying them into
+         * the fixed-size MetadataRecord buffers.
+         */
+        if (strlen(fields[0]) >= sizeof(records[record_count].path) ||
+            strlen(fields[1]) >= sizeof(records[record_count].filename) ||
+            strlen(fields[2]) >= sizeof(records[record_count].extension) ||
+            strlen(fields[4]) >= sizeof(records[record_count].modified_time) ||
+            strlen(fields[5]) >= sizeof(records[record_count].permissions))
+        {
+            fprintf(
+                stderr,
+                "Warning: field too long at line %d\n",
+                line_number
+            );
+
+            continue;
+        }
+
+        /*
+         * The fields have been validated above, so copying
+         * them with memcpy is safe and avoids unnecessary
+         * format-truncation warnings from GCC.
+         */
+        memcpy(
             records[record_count].path,
-            sizeof(records[record_count].path),
-            "%s",
-            fields[0]
+            fields[0],
+            strlen(fields[0]) + 1
         );
 
-        snprintf(
+        memcpy(
             records[record_count].filename,
-            sizeof(records[record_count].filename),
-            "%s",
-            fields[1]
+            fields[1],
+            strlen(fields[1]) + 1
         );
 
-        snprintf(
+        memcpy(
             records[record_count].extension,
-            sizeof(records[record_count].extension),
-            "%s",
-            fields[2]
+            fields[2],
+            strlen(fields[2]) + 1
         );
 
         records[record_count].size_bytes =
             atoll(fields[3]);
 
-        snprintf(
+        memcpy(
             records[record_count].modified_time,
-            sizeof(records[record_count].modified_time),
-            "%s",
-            fields[4]
+            fields[4],
+            strlen(fields[4]) + 1
         );
 
-        snprintf(
+        memcpy(
             records[record_count].permissions,
-            sizeof(records[record_count].permissions),
-            "%s",
-            fields[5]
+            fields[5],
+            strlen(fields[5]) + 1
         );
 
         records[record_count].is_hidden =
