@@ -30,6 +30,7 @@ file_analyzer
 sequential_analyzer
 parallel_analyzer
 benchmark
+benchmark4
 process_results
 compare_results
 
