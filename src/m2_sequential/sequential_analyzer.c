@@ -1,184 +1,253 @@
 #include "sequential_analyzer.h"
 
-#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#define LINE_SIZE 4096
-
-#define ONE_MB 1048576LL
-#define ONE_HUNDRED_MB 104857600LL
+#define LINE_SIZE 16384
+#define CSV_FIELD_COUNT 7
 
 /* ---------------------------------------------------------
-   Utility functions
-   --------------------------------------------------------- */
+ * Robust CSV parser
+ *
+ * Supports:
+ * - empty fields
+ * - quoted fields
+ * - commas inside quoted fields
+ * - escaped quotes ("")
+ * --------------------------------------------------------- */
 
-static void trim_newline(char *str)
+static int parse_csv_line(
+    const char *line,
+    char fields[CSV_FIELD_COUNT][LINE_SIZE]
+)
 {
-    size_t len;
+    int field = 0;
+    size_t pos = 0;
 
-    if (str == NULL) {
+    if (line == NULL || fields == NULL)
+        return 0;
+
+    for (int i = 0; i < CSV_FIELD_COUNT; i++)
+        fields[i][0] = '\0';
+
+    while (field < CSV_FIELD_COUNT)
+    {
+        size_t out = 0;
+        int quoted = 0;
+
+        if (line[pos] == ',')
+        {
+            fields[field][0] = '\0';
+            field++;
+            pos++;
+            continue;
+        }
+
+        if (line[pos] == '"')
+        {
+            quoted = 1;
+            pos++;
+        }
+
+        while (line[pos] != '\0')
+        {
+            char c = line[pos];
+
+            if (quoted)
+            {
+                if (c == '"')
+                {
+                    if (line[pos + 1] == '"')
+                    {
+                        if (out < LINE_SIZE - 1)
+                            fields[field][out++] = '"';
+
+                        pos += 2;
+                        continue;
+                    }
+
+                    quoted = 0;
+                    pos++;
+                    continue;
+                }
+
+                if (out < LINE_SIZE - 1)
+                    fields[field][out++] = c;
+
+                pos++;
+            }
+            else
+            {
+                if (c == ',')
+                    break;
+
+                if (c == '\r' || c == '\n')
+                    break;
+
+                if (out < LINE_SIZE - 1)
+                    fields[field][out++] = c;
+
+                pos++;
+            }
+        }
+
+        fields[field][out] = '\0';
+        field++;
+
+        if (line[pos] == ',')
+        {
+            pos++;
+            continue;
+        }
+
+        if (line[pos] == '\0' ||
+            line[pos] == '\r' ||
+            line[pos] == '\n')
+        {
+            break;
+        }
+    }
+
+    return field == CSV_FIELD_COUNT;
+}
+
+/* ---------------------------------------------------------
+ * CSV output escaping
+ *
+ * Fields containing comma, quote, CR or LF are wrapped
+ * in double quotes. Existing quotes are doubled.
+ * --------------------------------------------------------- */
+
+static void write_csv_field(
+    FILE *output,
+    const char *field
+)
+{
+    int needs_quotes = 0;
+
+    if (field == NULL)
+        field = "";
+
+    for (size_t i = 0; field[i] != '\0'; i++)
+    {
+        if (field[i] == ',' ||
+            field[i] == '"' ||
+            field[i] == '\r' ||
+            field[i] == '\n')
+        {
+            needs_quotes = 1;
+            break;
+        }
+    }
+
+    if (!needs_quotes)
+    {
+        fputs(field, output);
         return;
     }
 
-    len = strlen(str);
+    fputc('"', output);
 
-    while (len > 0 &&
-           (str[len - 1] == '\n' ||
-            str[len - 1] == '\r')) {
-        str[len - 1] = '\0';
-        len--;
-    }
-}
+    for (size_t i = 0; field[i] != '\0'; i++)
+    {
+        if (field[i] == '"')
+            fputc('"', output);
 
-static void trim_spaces(char *str)
-{
-    char *start;
-    char *end;
-
-    if (str == NULL || *str == '\0') {
-        return;
+        fputc(field[i], output);
     }
 
-    start = str;
-
-    while (*start != '\0' &&
-           isspace((unsigned char)*start)) {
-        start++;
-    }
-
-    if (start != str) {
-        memmove(str, start, strlen(start) + 1);
-    }
-
-    end = str + strlen(str);
-
-    while (end > str &&
-           isspace((unsigned char)*(end - 1))) {
-        end--;
-    }
-
-    *end = '\0';
+    fputc('"', output);
 }
 
 /* ---------------------------------------------------------
-   CSV parsing
-   --------------------------------------------------------- */
+ * Permission weight
+ * --------------------------------------------------------- */
 
-static int split_csv(char *line,
-                     char *fields[],
-                     int max_fields)
+static int get_permission_weight(const char *permissions)
 {
-    int count = 0;
-    char *token;
+    long permission_value;
 
-    token = strtok(line, ",");
+    if (permissions == NULL || permissions[0] == '\0')
+        return 0;
 
-    while (token != NULL && count < max_fields) {
-        trim_spaces(token);
-        fields[count++] = token;
-        token = strtok(NULL, ",");
-    }
+    permission_value = strtol(
+        permissions,
+        NULL,
+        8
+    );
 
-    return count;
+    if ((permission_value & 0200L) != 0)
+        return 1;
+
+    if (strchr(permissions, 'w') != NULL)
+        return 1;
+
+    return 0;
 }
 
 /* ---------------------------------------------------------
-   Extension categorization
-   --------------------------------------------------------- */
+ * Extension classification
+ * --------------------------------------------------------- */
 
-static void to_lower_string(char *str)
+static const char *classify_extension(const char *extension)
 {
-    size_t i;
-
-    if (str == NULL) {
-        return;
-    }
-
-    for (i = 0; str[i] != '\0'; i++) {
-        str[i] = (char)tolower(
-            (unsigned char)str[i]
-        );
-    }
-}
-
-static const char *get_extension_category(const char *extension)
-{
-    char ext[64];
-
-    if (extension == NULL) {
+    if (extension == NULL || extension[0] == '\0')
         return "OTHER";
-    }
 
-    snprintf(ext, sizeof(ext), "%s", extension);
-    to_lower_string(ext);
-
-    /* DOCUMENT */
-    if (strcmp(ext, ".txt") == 0 ||
-        strcmp(ext, ".pdf") == 0 ||
-        strcmp(ext, ".doc") == 0 ||
-        strcmp(ext, ".docx") == 0 ||
-        strcmp(ext, ".xls") == 0 ||
-        strcmp(ext, ".xlsx") == 0 ||
-        strcmp(ext, ".ppt") == 0 ||
-        strcmp(ext, ".pptx") == 0 ||
-        strcmp(ext, ".csv") == 0) {
+    if (strcmp(extension, ".txt") == 0 ||
+        strcmp(extension, ".pdf") == 0 ||
+        strcmp(extension, ".doc") == 0 ||
+        strcmp(extension, ".docx") == 0 ||
+        strcmp(extension, ".xls") == 0 ||
+        strcmp(extension, ".xlsx") == 0 ||
+        strcmp(extension, ".ppt") == 0 ||
+        strcmp(extension, ".pptx") == 0)
+    {
         return "DOCUMENT";
     }
 
-    /* IMAGE */
-    if (strcmp(ext, ".jpg") == 0 ||
-        strcmp(ext, ".jpeg") == 0 ||
-        strcmp(ext, ".png") == 0 ||
-        strcmp(ext, ".gif") == 0 ||
-        strcmp(ext, ".bmp") == 0 ||
-        strcmp(ext, ".tiff") == 0 ||
-        strcmp(ext, ".webp") == 0) {
+    if (strcmp(extension, ".jpg") == 0 ||
+        strcmp(extension, ".jpeg") == 0 ||
+        strcmp(extension, ".png") == 0 ||
+        strcmp(extension, ".gif") == 0 ||
+        strcmp(extension, ".bmp") == 0)
+    {
         return "IMAGE";
     }
 
-    /* AUDIO */
-    if (strcmp(ext, ".mp3") == 0 ||
-        strcmp(ext, ".wav") == 0 ||
-        strcmp(ext, ".flac") == 0 ||
-        strcmp(ext, ".aac") == 0 ||
-        strcmp(ext, ".ogg") == 0) {
+    if (strcmp(extension, ".mp3") == 0 ||
+        strcmp(extension, ".wav") == 0 ||
+        strcmp(extension, ".flac") == 0)
+    {
         return "AUDIO";
     }
 
-    /* VIDEO */
-    if (strcmp(ext, ".mp4") == 0 ||
-        strcmp(ext, ".avi") == 0 ||
-        strcmp(ext, ".mkv") == 0 ||
-        strcmp(ext, ".mov") == 0 ||
-        strcmp(ext, ".wmv") == 0 ||
-        strcmp(ext, ".webm") == 0) {
+    if (strcmp(extension, ".mp4") == 0 ||
+        strcmp(extension, ".avi") == 0 ||
+        strcmp(extension, ".mkv") == 0 ||
+        strcmp(extension, ".mov") == 0)
+    {
         return "VIDEO";
     }
 
-    /* ARCHIVE */
-    if (strcmp(ext, ".zip") == 0 ||
-        strcmp(ext, ".tar") == 0 ||
-        strcmp(ext, ".gz") == 0 ||
-        strcmp(ext, ".bz2") == 0 ||
-        strcmp(ext, ".7z") == 0 ||
-        strcmp(ext, ".rar") == 0) {
+    if (strcmp(extension, ".zip") == 0 ||
+        strcmp(extension, ".rar") == 0 ||
+        strcmp(extension, ".7z") == 0 ||
+        strcmp(extension, ".tar") == 0 ||
+        strcmp(extension, ".gz") == 0)
+    {
         return "ARCHIVE";
     }
 
-    /* CODE */
-    if (strcmp(ext, ".c") == 0 ||
-        strcmp(ext, ".h") == 0 ||
-        strcmp(ext, ".cpp") == 0 ||
-        strcmp(ext, ".hpp") == 0 ||
-        strcmp(ext, ".java") == 0 ||
-        strcmp(ext, ".py") == 0 ||
-        strcmp(ext, ".js") == 0 ||
-        strcmp(ext, ".ts") == 0 ||
-        strcmp(ext, ".html") == 0 ||
-        strcmp(ext, ".css") == 0) {
+    if (strcmp(extension, ".c") == 0 ||
+        strcmp(extension, ".h") == 0 ||
+        strcmp(extension, ".cpp") == 0 ||
+        strcmp(extension, ".java") == 0 ||
+        strcmp(extension, ".py") == 0 ||
+        strcmp(extension, ".js") == 0)
+    {
         return "CODE";
     }
 
@@ -186,367 +255,422 @@ static const char *get_extension_category(const char *extension)
 }
 
 /* ---------------------------------------------------------
-   Size categorization
-   --------------------------------------------------------- */
+ * Size classification
+ * --------------------------------------------------------- */
 
-static const char *get_size_category(long long size_bytes)
+static const char *classify_size(long long size)
 {
-    if (size_bytes < ONE_MB) {
+    if (size < 1024LL * 1024LL)
         return "SMALL";
-    }
 
-    if (size_bytes < ONE_HUNDRED_MB) {
+    if (size < 100LL * 1024LL * 1024LL)
         return "MEDIUM";
-    }
 
     return "LARGE";
 }
 
 /* ---------------------------------------------------------
-   Category weights
-   --------------------------------------------------------- */
+ * Extension weight
+ * --------------------------------------------------------- */
 
 static int get_extension_weight(const char *category)
 {
-    if (strcmp(category, "DOCUMENT") == 0) {
+    if (strcmp(category, "DOCUMENT") == 0)
         return 1;
-    }
 
-    if (strcmp(category, "IMAGE") == 0) {
+    if (strcmp(category, "IMAGE") == 0)
         return 2;
-    }
 
-    if (strcmp(category, "AUDIO") == 0) {
+    if (strcmp(category, "AUDIO") == 0)
         return 2;
-    }
 
-    if (strcmp(category, "VIDEO") == 0) {
+    if (strcmp(category, "VIDEO") == 0)
         return 3;
-    }
 
-    if (strcmp(category, "ARCHIVE") == 0) {
+    if (strcmp(category, "ARCHIVE") == 0)
         return 3;
-    }
 
-    if (strcmp(category, "CODE") == 0) {
+    if (strcmp(category, "CODE") == 0)
         return 2;
-    }
 
     return 1;
 }
 
-static int get_size_weight(const char *category)
-{
-    if (strcmp(category, "SMALL") == 0) {
-        return 1;
-    }
+/* ---------------------------------------------------------
+ * Size weight
+ * --------------------------------------------------------- */
 
-    if (strcmp(category, "MEDIUM") == 0) {
+static int get_size_weight(const char *size_category)
+{
+    if (strcmp(size_category, "SMALL") == 0)
+        return 1;
+
+    if (strcmp(size_category, "MEDIUM") == 0)
         return 2;
-    }
 
     return 3;
 }
 
 /* ---------------------------------------------------------
-   Permission weight
-   --------------------------------------------------------- */
+ * Analyze one metadata record
+ * --------------------------------------------------------- */
 
-static int get_permission_weight(const char *permissions)
-{
-    int value;
-
-    if (permissions == NULL ||
-        *permissions == '\0') {
-        return 0;
-    }
-
-    /*
-     * Permissions are normally represented as
-     * Unix-style values such as 644, 664, 600.
-     *
-     * Convert decimal representation to octal.
-     */
-    value = atoi(permissions);
-
-    /*
-     * Owner-write bit is 0200 in Unix permissions.
-     */
-    if ((value & 0200) != 0) {
-        return 1;
-    }
-
-    /*
-     * Some datasets may provide symbolic permissions,
-     * e.g. -rw-r--r--.
-     */
-    if (strchr(permissions, 'w') != NULL) {
-        return 1;
-    }
-
-    return 0;
-}
-
-/* ---------------------------------------------------------
-   Risk classification
-   --------------------------------------------------------- */
-
-static const char *get_risk_label(int score)
-{
-    if (score <= 3) {
-        return "LOW";
-    }
-
-    if (score <= 6) {
-        return "MEDIUM";
-    }
-
-    return "HIGH";
-}
-
-/* ---------------------------------------------------------
-   Analyze one record
-   --------------------------------------------------------- */
-
-void analyze_record(const MetadataRecord *record,
-                    AnalysisResult *result)
+void analyze_record(
+    const MetadataRecord *record,
+    AnalysisResult *result
+)
 {
     const char *extension_category;
     const char *size_category;
 
-    int extension_weight;
-    int size_weight;
-    int hidden_weight;
-    int permission_weight;
+    int score = 0;
 
-    if (record == NULL || result == NULL) {
+    if (record == NULL || result == NULL)
         return;
-    }
 
     extension_category =
-        get_extension_category(record->extension);
+        classify_extension(record->extension);
 
     size_category =
-        get_size_category(record->size_bytes);
+        classify_size(record->size_bytes);
 
-    extension_weight =
-        get_extension_weight(extension_category);
+    score += get_extension_weight(
+        extension_category
+    );
 
-    size_weight =
-        get_size_weight(size_category);
+    score += get_size_weight(
+        size_category
+    );
 
-    hidden_weight =
-        record->is_hidden ? 2 : 0;
+    if (record->is_hidden)
+        score += 2;
 
-    permission_weight =
-        get_permission_weight(record->permissions);
+    score += get_permission_weight(
+        record->permissions
+    );
 
-    snprintf(result->extension_category,
-             sizeof(result->extension_category),
-             "%s",
-             extension_category);
+    snprintf(
+        result->extension_category,
+        sizeof(result->extension_category),
+        "%s",
+        extension_category
+    );
 
-    snprintf(result->size_category,
-             sizeof(result->size_category),
-             "%s",
-             size_category);
+    snprintf(
+        result->size_category,
+        sizeof(result->size_category),
+        "%s",
+        size_category
+    );
 
-    result->score =
-        extension_weight +
-        size_weight +
-        hidden_weight +
-        permission_weight;
+    result->score = score;
 
-    snprintf(result->risk_label,
-             sizeof(result->risk_label),
-             "%s",
-             get_risk_label(result->score));
+    if (score <= 3)
+    {
+        snprintf(
+            result->risk_label,
+            sizeof(result->risk_label),
+            "LOW"
+        );
+    }
+    else if (score <= 6)
+    {
+        snprintf(
+            result->risk_label,
+            sizeof(result->risk_label),
+            "MEDIUM"
+        );
+    }
+    else
+    {
+        snprintf(
+            result->risk_label,
+            sizeof(result->risk_label),
+            "HIGH"
+        );
+    }
 }
 
 /* ---------------------------------------------------------
-   Sequential processing
-   --------------------------------------------------------- */
+ * Process metadata CSV sequentially
+ * --------------------------------------------------------- */
 
-int process_metadata(const char *input_csv,
-                     const char *output_csv,
-                     double *execution_time_seconds)
+int process_metadata(
+    const char *input_csv,
+    const char *output_csv,
+    double *execution_time_seconds
+)
 {
     FILE *input;
     FILE *output;
 
     char line[LINE_SIZE];
 
-    int first_line = 1;
+    MetadataRecord *records = NULL;
+    AnalysisResult *results = NULL;
+
+    size_t record_count = 0;
+    size_t capacity = 1024;
+
     int line_number = 0;
 
-    clock_t start;
-    clock_t end;
+    clock_t start_time;
+    clock_t end_time;
+
+    if (input_csv == NULL ||
+        output_csv == NULL)
+    {
+        return 0;
+    }
 
     input = fopen(input_csv, "r");
 
-    if (input == NULL) {
+    if (input == NULL)
+    {
         perror("Error opening input CSV");
-        return -1;
+        return 0;
+    }
+
+    records = malloc(
+        capacity * sizeof(MetadataRecord)
+    );
+
+    if (records == NULL)
+    {
+        fclose(input);
+        return 0;
+    }
+
+    /*
+     * Skip header.
+     */
+    if (fgets(line, sizeof(line), input) == NULL)
+    {
+        fclose(input);
+        free(records);
+        return 0;
+    }
+
+    line_number++;
+
+    start_time = clock();
+
+    while (fgets(line, sizeof(line), input) != NULL)
+    {
+        char fields[CSV_FIELD_COUNT][LINE_SIZE];
+
+        line_number++;
+
+        if (!parse_csv_line(line, fields))
+        {
+            fprintf(
+                stderr,
+                "Warning: invalid record at line %d\n",
+                line_number
+            );
+
+            continue;
+        }
+
+        if (record_count >= capacity)
+        {
+            size_t new_capacity = capacity * 2;
+
+            MetadataRecord *temp =
+                realloc(
+                    records,
+                    new_capacity *
+                    sizeof(MetadataRecord)
+                );
+
+            if (temp == NULL)
+            {
+                fclose(input);
+                free(records);
+                return 0;
+            }
+
+            records = temp;
+            capacity = new_capacity;
+        }
+
+        snprintf(
+            records[record_count].path,
+            sizeof(records[record_count].path),
+            "%s",
+            fields[0]
+        );
+
+        snprintf(
+            records[record_count].filename,
+            sizeof(records[record_count].filename),
+            "%s",
+            fields[1]
+        );
+
+        snprintf(
+            records[record_count].extension,
+            sizeof(records[record_count].extension),
+            "%s",
+            fields[2]
+        );
+
+        records[record_count].size_bytes =
+            atoll(fields[3]);
+
+        snprintf(
+            records[record_count].modified_time,
+            sizeof(records[record_count].modified_time),
+            "%s",
+            fields[4]
+        );
+
+        snprintf(
+            records[record_count].permissions,
+            sizeof(records[record_count].permissions),
+            "%s",
+            fields[5]
+        );
+
+        records[record_count].is_hidden =
+            atoi(fields[6]);
+
+        record_count++;
+    }
+
+    fclose(input);
+
+    results = malloc(
+        record_count * sizeof(AnalysisResult)
+    );
+
+    if (results == NULL)
+    {
+        free(records);
+        return 0;
+    }
+
+    /*
+     * Sequential analysis.
+     */
+    for (size_t i = 0; i < record_count; i++)
+    {
+        analyze_record(
+            &records[i],
+            &results[i]
+        );
+    }
+
+    end_time = clock();
+
+    if (execution_time_seconds != NULL)
+    {
+        *execution_time_seconds =
+            (double)(end_time - start_time) /
+            CLOCKS_PER_SEC;
     }
 
     output = fopen(output_csv, "w");
 
-    if (output == NULL) {
+    if (output == NULL)
+    {
         perror("Error opening output CSV");
-        fclose(input);
-        return -1;
+
+        free(records);
+        free(results);
+
+        return 0;
     }
 
-    fprintf(output,
-            "path,extension_category,size_category,score,risk_label\n");
+    fprintf(
+        output,
+        "path,extension_category,size_category,score,risk_label\n"
+    );
 
-    start = clock();
+    /*
+     * Write results.
+     *
+     * The path is escaped as a proper CSV field.
+     */
+    for (size_t i = 0; i < record_count; i++)
+    {
+        write_csv_field(
+            output,
+            records[i].path
+        );
 
-    while (fgets(line, sizeof(line), input) != NULL) {
-
-        char *fields[7];
-
-        MetadataRecord record;
-        AnalysisResult result;
-
-        int field_count;
-
-        line_number++;
-
-        trim_newline(line);
-
-        /*
-         * Skip CSV header.
-         */
-        if (first_line) {
-            first_line = 0;
-            continue;
-        }
-
-        /*
-         * Skip empty lines.
-         */
-        if (strlen(line) == 0) {
-            continue;
-        }
-
-        field_count =
-            split_csv(line, fields, 7);
-
-        if (field_count != 7) {
-            fprintf(stderr,
-                    "Warning: invalid record at line %d\n",
-                    line_number);
-            continue;
-        }
-
-        memset(&record, 0, sizeof(record));
-
-        snprintf(record.path,
-                 sizeof(record.path),
-                 "%s",
-                 fields[0]);
-
-        snprintf(record.filename,
-                 sizeof(record.filename),
-                 "%s",
-                 fields[1]);
-
-        snprintf(record.extension,
-                 sizeof(record.extension),
-                 "%s",
-                 fields[2]);
-
-        record.size_bytes =
-            atoll(fields[3]);
-
-        snprintf(record.modified_time,
-                 sizeof(record.modified_time),
-                 "%s",
-                 fields[4]);
-
-        snprintf(record.permissions,
-                 sizeof(record.permissions),
-                 "%s",
-                 fields[5]);
-
-        record.is_hidden =
-            atoi(fields[6]);
-
-        analyze_record(&record, &result);
-
-        fprintf(output,
-                "%s,%s,%s,%d,%s\n",
-                record.path,
-                result.extension_category,
-                result.size_category,
-                result.score,
-                result.risk_label);
+        fprintf(
+            output,
+            ",%s,%s,%d,%s\n",
+            results[i].extension_category,
+            results[i].size_category,
+            results[i].score,
+            results[i].risk_label
+        );
     }
 
-    end = clock();
-
-    fclose(input);
     fclose(output);
 
-    if (execution_time_seconds != NULL) {
-        *execution_time_seconds =
-            (double)(end - start) /
-            (double)CLOCKS_PER_SEC;
-    }
+    free(records);
+    free(results);
 
-    return 0;
+    return 1;
 }
 
 /* ---------------------------------------------------------
-   Main program
-   --------------------------------------------------------- */
+ * Main
+ * --------------------------------------------------------- */
 
 #ifndef M2_NO_MAIN
 
 int main(int argc, char *argv[])
 {
-    const char *input_csv;
-    const char *output_csv;
-
     double execution_time = 0.0;
 
-    if (argc == 1) {
-
-        input_csv =
-            "intermediate/metadata.csv";
-
-        output_csv =
-            "outputs/sequential.csv";
-
-    } else if (argc == 3) {
-
-        input_csv = argv[1];
-        output_csv = argv[2];
-
-    } else {
-
-        fprintf(stderr,
-                "Usage: %s [input_csv output_csv]\n",
-                argv[0]);
+    if (argc != 3)
+    {
+        fprintf(
+            stderr,
+            "Usage: %s <metadata.csv> <output.csv>\n",
+            argv[0]
+        );
 
         return EXIT_FAILURE;
     }
 
-    if (process_metadata(input_csv,
-                         output_csv,
-                         &execution_time) != 0) {
+    if (!process_metadata(
+            argv[1],
+            argv[2],
+            &execution_time))
+    {
+        fprintf(
+            stderr,
+            "Sequential analysis failed.\n"
+        );
 
         return EXIT_FAILURE;
     }
 
-    printf("Sequential analysis completed successfully.\n");
-    printf("Input : %s\n", input_csv);
-    printf("Output: %s\n", output_csv);
-    printf("Execution time: %.9f seconds\n",
-           execution_time);
+    printf(
+        "Sequential analysis completed successfully.\n"
+    );
+
+    printf(
+        "Input : %s\n",
+        argv[1]
+    );
+
+    printf(
+        "Output: %s\n",
+        argv[2]
+    );
+
+    printf(
+        "Execution time: %.6f seconds\n",
+        execution_time
+    );
 
     return EXIT_SUCCESS;
 }
 
-#endif// M2: sequential computation
+#endif

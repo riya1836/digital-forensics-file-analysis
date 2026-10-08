@@ -5,7 +5,12 @@
 #include <string.h>
 #include <ctype.h>
 #include <omp.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <time.h>
+#endif
 
 #define INITIAL_CAPACITY 1024
 #define MB (1024LL * 1024LL)
@@ -63,7 +68,7 @@ static void lowercase_string(const char *input,
 
 /*
  * Parse one CSV line.
-
+ *
  * Expected columns:
  *
  * path,
@@ -73,13 +78,6 @@ static void lowercase_string(const char *input,
  * modified_time,
  * permissions,
  * is_hidden
- *
- * We only need:
- *   path
- *   extension
- *   size_bytes
- *   permissions
- *   is_hidden
  *
  * The parser supports quoted CSV fields and commas inside
  * quoted fields.
@@ -137,6 +135,9 @@ static int parse_csv_line(const char *line,
 
         p++;
     }
+
+    if (in_quotes)
+        return 0;
 
     if (field_index >= 7)
         return 0;
@@ -385,20 +386,6 @@ const char *categorize_size(long long size_bytes)
    Permission Weight
    ============================================================ */
 
-/*
- * Permission weight:
- *
- * 1 = owner has write permission
- * 0 = otherwise
- *
- * Metadata permissions are expected in forms such as:
- *
- * 644
- * 664
- * 755
- *
- * We check the owner-write bit.
- */
 static int get_permission_weight(const char *permissions)
 {
     long permission_value;
@@ -542,9 +529,6 @@ int analyze_parallel(const MetadataRecord *records,
      * OpenMP parallelization:
      *
      * Every metadata record can be analyzed independently.
-     *
-     * Each iteration writes only to results[i].
-     * Therefore there is no shared-write race between iterations.
      */
     #pragma omp parallel for \
         num_threads(num_threads) \
@@ -664,9 +648,6 @@ int write_results_csv(const char *filename,
         return 0;
     }
 
-    /*
-     * Required M3 output schema.
-     */
     fprintf(
         file,
         "path,extension_category,size_category,score,risk_label\n"
@@ -729,6 +710,23 @@ void free_metadata(MetadataRecord *records)
 
 static double get_time_seconds(void)
 {
+#ifdef _WIN32
+
+    static LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+
+    if (frequency.QuadPart == 0)
+    {
+        QueryPerformanceFrequency(&frequency);
+    }
+
+    QueryPerformanceCounter(&counter);
+
+    return (double)counter.QuadPart /
+           (double)frequency.QuadPart;
+
+#else
+
     struct timespec ts;
 
     clock_gettime(
@@ -738,6 +736,8 @@ static double get_time_seconds(void)
 
     return (double)ts.tv_sec +
            (double)ts.tv_nsec / 1e9;
+
+#endif
 }
 
 
@@ -793,10 +793,7 @@ int main(int argc, char *argv[])
     }
 
     /*
-     * Read metadata.
-     *
-     * This happens before timing so that the benchmark focuses
-     * on the computational analysis rather than CSV loading.
+     * Read metadata before timing.
      */
     if (!read_metadata_csv(
             input_file,
@@ -820,8 +817,6 @@ int main(int argc, char *argv[])
 
     /*
      * Allocate result array.
-     *
-     * Each input record has exactly one corresponding result.
      */
     results = malloc(
         record_count * sizeof(AnalysisResult)
@@ -841,9 +836,6 @@ int main(int argc, char *argv[])
 
     /*
      * Measure ONLY the parallel analysis.
-     *
-     * CSV reading and output writing are outside this timing
-     * section to keep the comparison focused on the algorithm.
      */
     start_time = get_time_seconds();
 
@@ -883,16 +875,24 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    /*
-     * Program summary.
-     *
-     * M4 can capture this execution time later.
-     */
-    printf("Parallel analysis completed successfully.\n");
-    printf("Records processed : %zu\n", record_count);
-    printf("Threads used      : %d\n", num_threads);
-    printf("Execution time    : %.9f seconds\n",
-           execution_time);
+    printf(
+        "Parallel analysis completed successfully.\n"
+    );
+
+    printf(
+        "Records processed : %zu\n",
+        record_count
+    );
+
+    printf(
+        "Threads used      : %d\n",
+        num_threads
+    );
+
+    printf(
+        "Execution time    : %.9f seconds\n",
+        execution_time
+    );
 
     free(results);
     free_metadata(records);
