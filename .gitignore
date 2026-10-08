@@ -14,7 +14,27 @@ build/
 # OS-generated files
 .DS_Store
 Thumbs.db
+
+# Python virtual environment
 .venv/
 
 # Generated CSV files
 *.csv
+
+# Keep M4 benchmark results in the repository
+!results/raw/benchmark_results.csv
+!results/processed/performance_summary.csv
+
+# Compiled Linux executables
+file_analyzer
+sequential_analyzer
+parallel_analyzer
+benchmark
+process_results
+compare_results
+
+# Generated intermediate data
+intermediate/metadata.csv
+
+# M3 generated test outputs
+tests/m3_test_output/

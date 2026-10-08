@@ -1,1 +1,16 @@
 input_size,threads,mode,execution_time_seconds
+small,1,sequential,0.068343
+small,1,parallel,0.092222
+small,2,parallel,0.074334
+small,4,parallel,0.083217
+small,8,parallel,0.091993
+medium,1,sequential,0.293444
+medium,1,parallel,0.434202
+medium,2,parallel,0.347712
+medium,4,parallel,0.415669
+medium,8,parallel,0.351703
+large,1,sequential,0.475303
+large,1,parallel,0.712155
+large,2,parallel,0.590155
+large,4,parallel,0.526815
+large,8,parallel,0.607795
